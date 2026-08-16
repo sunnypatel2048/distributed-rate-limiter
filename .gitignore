@@ -1,0 +1,14 @@
+## .NET
+bin/
+obj/
+*.user
+
+## Rider / JetBrains
+.idea/
+*.sln.iml
+
+## macOS
+.DS_Store
+
+## Misc
+*.log
