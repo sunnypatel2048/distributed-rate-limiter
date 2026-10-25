@@ -96,7 +96,12 @@ If Redis becomes unavailable, the limiter has two options:
 - **Fail open** — allow all requests through. Preserves API availability but temporarily removes protection.
 - **Fail closed** — reject all requests. Protects downstream systems but turns a Redis blip into a full outage.
 
-**Decision:** _TODO — document which mode this implementation uses and why once built._
+**Decision: configurable per route, fail open by default.** Each policy sets `FailureMode`:
+
+- `FailOpen` (default): the request goes through and a warning is logged. For most routes, an unprotected-but-working API beats a fully down one.
+- `FailClosed`: the request gets `503 Service Unavailable`. Used in the demo for `/api/search`, an expensive endpoint that would rather switch off than run unprotected.
+
+Client disconnects (`OperationCanceledException`) are deliberately *not* treated as limiter failures: a client giving up says nothing about Redis's health.
 
 ## Tech stack
 
@@ -107,29 +112,89 @@ If Redis becomes unavailable, the limiter has two options:
 
 ## Getting started
 
+Prerequisites: .NET 10 SDK, Docker
+
 ```bash
-# TODO: fill in once scaffolding is complete
-git clone <repo-url>
-cd rate-limiter
-docker compose up
+git clone https://github.com/sunnypatel2048/distributed-rate-limiter.git
+cd distributed-rate-limiter
+docker compose up -d                      # Redis on localhost:6379
+dotnet run --project src/RateLimiter.Demo
 ```
 
-Prerequisites: .NET 10 SDK, Docker
+Hit an endpoint until it's limited (use the port printed by `dotnet run`):
+
+```bash
+for i in $(seq 1 11); do
+  curl -s -o /dev/null -w "%{http_code}\n" -H "X-Api-Key: demo" http://localhost:<port>/api/orders
+done
+# 200 x10, then 429
+```
+
+Run the tests:
+
+```bash
+dotnet test                                      # everything (integration tests need Docker running)
+dotnet test --filter "Category!=Integration"     # fast unit tests only, no Docker
+```
+
+### Using it in your own API
+
+```csharp
+builder.Services.AddSingleton<IConnectionMultiplexer>(_ => ConnectionMultiplexer.Connect("localhost:6379"));
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton<IRateLimiterFactory, RedisRateLimiterFactory>(); // or RateLimiterFactory for in-memory
+builder.Services.AddDistributedRateLimiting(builder.Configuration);
+
+var app = builder.Build();
+app.UseDistributedRateLimiting();
+```
 
 ## API reference
 
-| Endpoint | Description |
-|---|---|
-| `GET /demo` | Example endpoint protected by the rate limiter middleware |
-| `GET /metrics` | Returns allowed vs. rejected request counts |
+### Configuration
 
-**Response headers on limited routes**
+Policies live in the `RateLimiting` section of `appsettings.json` and are validated at startup (duplicate names, non-positive limits or windows, and prefixes without a leading `/` fail the app on boot):
+
+```json
+"RateLimiting": {
+  "ApiKeyHeader": "X-Api-Key",
+  "Policies": [
+    { "Name": "orders", "PathPrefix": "/api/orders", "Algorithm": "TokenBucket",
+      "PermitLimit": 10, "Window": "00:01:00", "FailureMode": "FailOpen" },
+    { "Name": "search", "PathPrefix": "/api/search", "Algorithm": "SlidingWindowCounter",
+      "PermitLimit": 20, "Window": "00:01:00", "FailureMode": "FailClosed" },
+    { "Name": "api-default", "PathPrefix": "/api", "Algorithm": "FixedWindow",
+      "PermitLimit": 100, "Window": "00:01:00", "FailureMode": "FailOpen" }
+  ]
+}
+```
+
+- **Matching:** the longest matching `PathPrefix` wins (segment-aware and case-insensitive), so `"/"` works as a catch-all. Unmatched paths are not limited.
+- **Quota scope:** one quota per client per *policy*. `/api/orders` and `/api/orders/42` draw from the same bucket.
+- **Client identity:** the `X-Api-Key` header if present (SHA-256 hashed before it touches Redis), otherwise the client IP. Swap `IClientIdResolver` to key on an authenticated user instead. The API key is not validated, so in production put authentication in front of the limiter.
+
+### Demo endpoints
+
+| Endpoint | Policy | Algorithm | Limit |
+|---|---|---|---|
+| `GET /api/orders`, `GET /api/orders/{id}` | `orders` | Token Bucket | 10 / min |
+| `GET /api/search?q=` | `search` | Sliding Window Counter (fail closed) | 20 / min |
+| `GET /api/products` | `api-default` | Fixed Window | 100 / min |
+| `GET /health`, `GET /redis-check` | none | not limited | |
+
+### Response headers on limited routes
 
 | Header | Description |
 |---|---|
-| `X-RateLimit-Limit` | Configured limit for the client/route |
-| `X-RateLimit-Remaining` | Requests remaining in the current window |
-| `Retry-After` | Seconds until the client can retry (on 429 only) |
+| `X-RateLimit-Limit` | Configured limit for the matched policy |
+| `X-RateLimit-Remaining` | Requests remaining |
+| `Retry-After` | Whole seconds until a retry can succeed (on `429` only; never `0`) |
+
+A denied request gets `429 Too Many Requests` with a JSON body:
+
+```json
+{ "error": "rate_limited", "policy": "orders", "retryAfterSeconds": 6 }
+```
 
 ## Benchmarks
 
@@ -143,12 +208,18 @@ _TODO — fill in after load testing (Week 2)._
 ## Project structure
 
 ```
-# TODO: fill in once scaffolding is complete
 src/
-  RateLimiter.Core/       # algorithm implementations, strategy interface
-  RateLimiter.Middleware/ # .NET middleware integration
-  RateLimiter.Demo/       # demo API using the middleware
+  RateLimiter.Core/
+    Algorithms/            # in-memory Fixed Window, Sliding Window Counter, Token Bucket
+    Redis/                 # Redis-backed versions of the same three algorithms
+      Scripts/*.lua        # atomic Lua scripts, embedded in the DLL
+    RateLimiterFactory.cs        # in-memory factory
+    RedisRateLimiterFactory.cs   # distributed factory
+  RateLimiter.Middleware/  # ASP.NET Core middleware, route policies, client resolution
+  RateLimiter.Demo/        # demo API configured entirely from appsettings.json
 tests/
+  RateLimiter.Core.Tests/        # algorithm unit tests + Redis integration tests (Testcontainers)
+  RateLimiter.Middleware.Tests/  # middleware unit tests + end-to-end HTTP tests against real Redis
 docker-compose.yml
 ```
 
