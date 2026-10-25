@@ -69,18 +69,21 @@ Keeping all rate-limit state out of the app process is what makes horizontal sca
 
 ## Redis key design
 
-```
-Key:    ratelimit:{clientId}:{route}
-TTL:    matches the window size (e.g. 60s) so stale keys self-expire
-Value:  Fixed/Sliding Window → integer counter
-        Token Bucket → hash { tokens, lastRefillTimestamp }
-```
+| Algorithm | Key | Value | TTL |
+|---|---|---|---|
+| Fixed Window | `ratelimit:fw:{clientId:route}:<windowStartMs>` | integer counter | 1x window |
+| Sliding Window Counter | `ratelimit:sw:{clientId:route}:<windowStartMs>` | integer counter | 2x window (must outlive its turn as "previous") |
+| Token Bucket | `ratelimit:tb:{clientId:route}` | hash `{ tokens, last_refill_ms }` | 2x window (cleanup only; a missing bucket reads as full) |
+
+- **Window start in the key name** means "window rolled over" is just "a different key" — Redis TTLs do all the cleanup, and there is no reset logic anywhere.
+- **`{clientId:route}` is a Redis Cluster hash tag.** Only the braced part is hashed, so all keys for one client+route land on the same shard. Sliding Window's script touches two keys at once, which would fail in a cluster if they lived on different shards.
+- **Time comes from the app, not Redis.** Each script receives "now" from the caller's `TimeProvider` rather than calling `redis.call('TIME')`, so tests drive window rollover and refills with `FakeTimeProvider`. The trade-off is sensitivity to clock skew between instances; the Token Bucket script never lets `last_refill_ms` move backwards, so a lagging instance can't re-earn tokens.
 
 ## Request flow
 
 1. Client request hits the load balancer, routed to any app instance
 2. Middleware extracts a client identifier (API key, user ID, or IP) and the target route
-3. Middleware invokes the Redis Lua script for the configured algorithm against key `ratelimit:{clientId}:{route}`
+3. Middleware invokes the Redis Lua script for the configured algorithm against keys tagged `{clientId:route}`
 4. Redis atomically checks and updates state, returning allow/deny plus remaining quota
 5. **Allowed** → request forwarded to the handler; response includes `X-RateLimit-Remaining`
 6. **Denied** → middleware short-circuits with `429`, includes `Retry-After`

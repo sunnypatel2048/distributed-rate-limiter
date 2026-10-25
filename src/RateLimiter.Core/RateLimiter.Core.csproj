@@ -10,4 +10,10 @@
     <PackageReference Include="StackExchange.Redis" Version="3.1.13" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Lua scripts ship inside the DLL with a fixed resource name, so they're
+         editable as real .lua files but impossible to "forget to deploy". -->
+    <EmbeddedResource Include="Redis/Scripts/*.lua" LogicalName="RateLimiter.Core.Scripts.%(Filename)%(Extension)" />
+  </ItemGroup>
+
 </Project>
