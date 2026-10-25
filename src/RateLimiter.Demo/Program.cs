@@ -1,4 +1,5 @@
 using RateLimiter.Core;
+using RateLimiter.Middleware;
 using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -6,7 +7,8 @@ var builder = WebApplication.CreateBuilder(args);
 // Single shared multiplexer for the app's lifetime — StackExchange.Redis
 // is thread-safe and designed to be reused, not created per-request.
 // AbortOnConnectFail=false lets the app start even if Redis isn't up yet;
-// the multiplexer keeps retrying in the background.
+// the multiplexer keeps retrying in the background (and the middleware
+// applies each policy's FailureMode in the meantime).
 builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
 {
     var redisOptions = ConfigurationOptions.Parse(
@@ -15,51 +17,47 @@ builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
     return ConnectionMultiplexer.Connect(redisOptions);
 });
 
-// TimeProvider.System is the real clock in production; tests substitute
-// FakeTimeProvider instead. Registering it here (rather than each algorithm
-// calling DateTimeOffset.UtcNow directly) is what makes the whole chain testable.
 builder.Services.AddSingleton(TimeProvider.System);
 
 // Storage backend is chosen here, in one line. Swap to RateLimiterFactory for
 // single-instance, in-memory limiting (e.g. local dev without Docker).
 builder.Services.AddSingleton<IRateLimiterFactory, RedisRateLimiterFactory>();
 
+// Policies come from the "RateLimiting" section of appsettings.json and are
+// validated at startup.
+builder.Services.AddDistributedRateLimiting(builder.Configuration);
+
 var app = builder.Build();
 
-app.MapGet("/", () => "Rate limiter demo API is running.");
+app.UseDistributedRateLimiting();
 
-// Quick sanity check: confirms the app can actually reach Redis.
+// Not under /api, so no policy matches: never rate limited.
+app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+
 app.MapGet("/redis-check", async (IConnectionMultiplexer redis) =>
 {
-    var db = redis.GetDatabase();
-    var pong = await db.PingAsync();
+    var pong = await redis.GetDatabase().PingAsync();
     return Results.Ok(new { redis = "connected", latencyMs = pong.TotalMilliseconds });
 });
 
-// Manual end-to-end check of the Redis-backed limiters: 5 requests per 60s.
-// Try: for i in {1..6}; do curl -i "localhost:<port>/rate-limit-check/TokenBucket?client=me"; done
-// The 6th call returns 429 with a Retry-After header. This is still NOT the real
-// middleware — that's next week — it just exercises the limiter directly.
-app.MapGet("/rate-limit-check/{algorithm}", async (
-    RateLimiterAlgorithm algorithm,
-    string? client,
-    IRateLimiterFactory factory,
-    HttpContext http) =>
+var api = app.MapGroup("/api");
+
+// "orders" policy: Token Bucket, tolerates short bursts.
+api.MapGet("/orders", () => Results.Ok(new[]
 {
-    var options = new RateLimiterOptions { PermitLimit = 5, Window = TimeSpan.FromSeconds(60) };
-    var limiter = factory.Create(algorithm, options);
-    var result = await limiter.CheckAsync(client ?? "anonymous", $"/rate-limit-check/{algorithm}");
+    new { id = 1, item = "Mechanical keyboard", quantity = 1 },
+    new { id = 2, item = "USB-C hub", quantity = 2 }
+}));
+api.MapGet("/orders/{id:int}", (int id) => Results.Ok(new { id, item = "Mechanical keyboard", quantity = 1 }));
 
-    http.Response.Headers["X-RateLimit-Limit"] = result.Limit.ToString();
-    http.Response.Headers["X-RateLimit-Remaining"] = result.Remaining.ToString();
+// "search" policy: Sliding Window, and FailClosed -- an expensive endpoint we'd
+// rather turn off than leave unprotected while Redis is down.
+api.MapGet("/search", (string? q) => Results.Ok(new { query = q ?? string.Empty, results = Array.Empty<string>() }));
 
-    if (!result.IsAllowed)
-    {
-        http.Response.Headers.RetryAfter = Math.Ceiling(result.RetryAfter.TotalSeconds).ToString();
-        return Results.StatusCode(StatusCodes.Status429TooManyRequests);
-    }
-
-    return Results.Ok(new { algorithm = algorithm.ToString(), allowed = true, remaining = result.Remaining });
-});
+// Everything else under /api falls through to the "api-default" policy.
+api.MapGet("/products", () => Results.Ok(new[] { new { id = 1, name = "Mechanical keyboard" } }));
 
 app.Run();
+
+// Exposes the implicit Program class to WebApplicationFactory<Program> in the end-to-end tests.
+public partial class Program;
