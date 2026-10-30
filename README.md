@@ -112,7 +112,7 @@ Client disconnects (`OperationCanceledException`) are deliberately *not* treated
 - .NET 10 (minimal API + middleware)
 - Redis (state store, Lua scripting)
 - Docker Compose + nginx (local 3-replica cluster behind a load balancer)
-- k6 (load testing)
+- k6 (load testing, run as a container)
 
 ## Getting started
 
@@ -219,12 +219,35 @@ A denied request gets `429 Too Many Requests` with a JSON body:
 
 ## Benchmarks
 
-_TODO — fill in after load testing (Week 2)._
+Load tests use [k6](https://k6.io), run against the full Docker Compose cluster (nginx → 3 replicas → Redis). k6 runs as a container on the same Docker network, so Docker Desktop's host port forwarding stays out of the numbers.
 
-| Scenario | Replicas | Throughput (req/s) | p50 latency | p95 latency | p99 latency |
-|---|---|---|---|---|---|
-| Sustained load | | | | | |
-| Burst load | | | | | |
+```bash
+docker compose up -d --build
+docker compose run --rm k6                                            # default: 500 req/s, 30s per scenario
+docker compose run --rm -e RATE=1000 -e DURATION_SECONDS=60 k6        # push harder
+```
+
+Three scenarios run back to back, never overlapping:
+
+| Scenario | What it sends | What it measures |
+|---|---|---|
+| `baseline` | `/health` (no policy matches) | The cost of everything *except* the limiter: nginx hop, Kestrel, routing |
+| `rate_limited` | `/api/orders`, `/api/search`, `/api/products` from 100k random clients | Latency with the limiter's Redis round trip on every request, per algorithm. The difference from `baseline` is the limiter's overhead |
+| `burst` | 20 "hot" clients hammering `/api/orders` far over their limit | Correctness under load: total allowed must match the Token Bucket math (10 up front + 5 refilled per client in 30s) across all replicas |
+
+The run fails if any response is not `200`/`429`, if k6 can't keep up with the target rate (dropped iterations), if p99 exceeds 100 ms, or if the burst's allowed count falls outside the expected range. Full results are written to `loadtest/results/latest-summary.json` (git-ignored).
+
+_Results: TODO — fill in from a real run._
+
+| Scenario | Throughput (req/s) | p50 | p95 | p99 |
+|---|---|---|---|---|
+| Baseline (no limiter) | | | | |
+| Rate limited (all algorithms) | | | | |
+| — Token Bucket | | | | |
+| — Sliding Window Counter | | | | |
+| — Fixed Window | | | | |
+
+All numbers come from a single laptop running every container plus the load generator, so they're a lower bound and best read *relative to each other*. The limiter overhead (`rate_limited` minus `baseline`) is the meaningful figure.
 
 ## Project structure
 
@@ -243,6 +266,7 @@ tests/
   RateLimiter.Middleware.Tests/  # middleware unit tests + end-to-end HTTP tests against real Redis
 deploy/nginx/nginx.conf    # load balancer config
 scripts/verify-cluster.sh  # proves one combined limit across replicas
+loadtest/k6/benchmark.js   # k6 load test (baseline vs. rate limited vs. burst)
 docker-compose.yml         # Redis, 3 app replicas, nginx
 ```
 
