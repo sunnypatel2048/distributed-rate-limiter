@@ -36,18 +36,22 @@ Most rate limiter tutorials use a single in-memory counter, which silently break
 
 ```mermaid
 flowchart TD
-    Client[Client] --> LB[Load Balancer]
-    LB --> I1[App Instance 1]
-    LB --> I2[App Instance 2]
-    LB --> IN[App Instance N]
+    Client[Client] --> LB[nginx<br/>round-robin load balancer]
+    LB --> I1[app1]
+    LB --> I2[app2]
+    LB --> I3[app3]
     I1 --> Redis[(Redis<br/>Atomic Lua Script)]
     I2 --> Redis
-    IN --> Redis
+    I3 --> Redis
     Redis -->|Allowed| Allow[Forward to Handler]
     Redis -->|Denied| Deny[429 Too Many Requests]
 ```
 
 App instances are stateless — they hold no counters in memory. Redis is the single source of truth for rate limit state, shared across every instance, so the limit is enforced consistently no matter which instance a request lands on.
+
+`docker compose up` runs exactly this topology locally (see [Running the cluster](#running-the-3-replica-cluster)). nginx round-robins requests, so consecutive requests from the *same* client deliberately land on *different* replicas — the case a per-process counter gets wrong.
+
+**Real client IPs behind the proxy.** Behind nginx, every request's source IP is nginx's own address, so naive IP-based limiting would put all clients in one shared bucket. nginx sets `X-Forwarded-For`, and the app honours that header **only when the request comes from nginx's fixed address** (`ReverseProxy:TrustedProxies`). It is ignored from anyone else, so a client can't pick its own rate-limit identity by sending the header. Only the last hop is read (`ForwardLimit = 1`), and the IPv4-mapped IPv6 form of the proxy address is trusted too, because Kestrel listens on IPv6 inside containers.
 
 ## Design decisions
 
@@ -107,7 +111,7 @@ Client disconnects (`OperationCanceledException`) are deliberately *not* treated
 
 - .NET 10 (minimal API + middleware)
 - Redis (state store, Lua scripting)
-- Docker Compose (local multi-instance setup)
+- Docker Compose + nginx (local 3-replica cluster behind a load balancer)
 - k6 (load testing)
 
 ## Getting started
@@ -117,7 +121,7 @@ Prerequisites: .NET 10 SDK, Docker
 ```bash
 git clone https://github.com/sunnypatel2048/distributed-rate-limiter.git
 cd distributed-rate-limiter
-docker compose up -d                      # Redis on localhost:6379
+docker compose up -d redis                # just Redis on localhost:6379
 dotnet run --project src/RateLimiter.Demo
 ```
 
@@ -136,6 +140,23 @@ Run the tests:
 dotnet test                                      # everything (integration tests need Docker running)
 dotnet test --filter "Category!=Integration"     # fast unit tests only, no Docker
 ```
+
+### Running the 3-replica cluster
+
+```bash
+docker compose up -d --build          # nginx on :8080 -> app1/app2/app3 -> Redis
+./scripts/verify-cluster.sh           # one client, 30 concurrent requests
+```
+
+The script sends 30 concurrent requests to `/api/orders` (10/min) as a single client and reports how many succeeded, and which replica served each one (from the `X-Served-By` response header). It passes only if **exactly 10** were allowed in total while the requests were spread across **at least two replicas**: proof that three independent processes are enforcing one shared limit. With per-process counters, you'd see up to 30 allowed (10 per replica).
+
+```bash
+docker compose logs -f nginx          # watch round-robin: each line shows the replica picked
+docker compose stop redis             # try failure handling: /api/orders fails open, /api/search returns 503
+docker compose down                   # tear it all down
+```
+
+The app replicas aren't published to the host; the only way in is through nginx on port 8080.
 
 ### Using it in your own API
 
@@ -216,11 +237,13 @@ src/
     RateLimiterFactory.cs        # in-memory factory
     RedisRateLimiterFactory.cs   # distributed factory
   RateLimiter.Middleware/  # ASP.NET Core middleware, route policies, client resolution
-  RateLimiter.Demo/        # demo API configured entirely from appsettings.json
+  RateLimiter.Demo/        # demo API configured entirely from appsettings.json (+ Dockerfile)
 tests/
   RateLimiter.Core.Tests/        # algorithm unit tests + Redis integration tests (Testcontainers)
   RateLimiter.Middleware.Tests/  # middleware unit tests + end-to-end HTTP tests against real Redis
-docker-compose.yml
+deploy/nginx/nginx.conf    # load balancer config
+scripts/verify-cluster.sh  # proves one combined limit across replicas
+docker-compose.yml         # Redis, 3 app replicas, nginx
 ```
 
 ## Future improvements

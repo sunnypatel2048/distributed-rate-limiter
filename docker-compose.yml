@@ -1,7 +1,32 @@
+# Two ways to use this file:
+#   docker compose up -d redis      -> just Redis on localhost:6379 (for `dotnet run` and the tests)
+#   docker compose up -d --build    -> the full cluster: nginx -> 3 app replicas -> 1 Redis
+#
+# The API is then on http://localhost:8080 (through nginx). The app replicas are
+# deliberately NOT published to the host, so the only way in is through the proxy --
+# which is also why it's safe for them to trust X-Forwarded-For from nginx.
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: src/RateLimiter.Demo/Dockerfile
+  image: ratelimiter-demo:local
+  depends_on:
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+  networks:
+    - ratelimiter
+  environment: &app-env
+    ASPNETCORE_ENVIRONMENT: Production
+    ConnectionStrings__Redis: redis:6379
+    # nginx's fixed address on the network below; the only proxy whose
+    # X-Forwarded-For header the apps will believe.
+    ReverseProxy__TrustedProxies__0: 172.28.0.10
+
 services:
   redis:
     image: redis:7-alpine
-    container_name: ratelimiter-redis
     ports:
       - "6379:6379"
     healthcheck:
@@ -9,3 +34,47 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      - ratelimiter
+
+  app1:
+    <<: *app
+    hostname: app1
+    environment:
+      <<: *app-env
+      InstanceName: app1
+
+  app2:
+    <<: *app
+    hostname: app2
+    environment:
+      <<: *app-env
+      InstanceName: app2
+
+  app3:
+    <<: *app
+    hostname: app3
+    environment:
+      <<: *app-env
+      InstanceName: app3
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app1
+      - app2
+      - app3
+    restart: unless-stopped
+    networks:
+      ratelimiter:
+        ipv4_address: 172.28.0.10
+
+networks:
+  ratelimiter:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

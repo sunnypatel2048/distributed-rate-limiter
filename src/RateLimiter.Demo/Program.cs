@@ -27,8 +27,24 @@ builder.Services.AddSingleton<IRateLimiterFactory, RedisRateLimiterFactory>();
 // validated at startup.
 builder.Services.AddDistributedRateLimiting(builder.Configuration);
 
+// Behind nginx, trust X-Forwarded-For only from the proxies listed in
+// ReverseProxy:TrustedProxies (set by docker-compose; empty for local dev).
+builder.Services.AddTrustedReverseProxies(builder.Configuration);
+
 var app = builder.Build();
 
+// Tag every response -- including 429s -- with the instance that handled it, so
+// you can watch the load balancer spread one client's requests across replicas
+// while the shared Redis enforces a single combined limit.
+var instanceName = builder.Configuration["InstanceName"] ?? Environment.MachineName;
+app.Use(async (context, next) =>
+{
+    context.Response.Headers["X-Served-By"] = instanceName;
+    await next(context);
+});
+
+// Order matters: resolve the real client IP first, THEN rate limit on it.
+app.UseTrustedReverseProxies();
 app.UseDistributedRateLimiting();
 
 // Not under /api, so no policy matches: never rate limited.
