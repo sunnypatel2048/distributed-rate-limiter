@@ -20,6 +20,7 @@
 
 import http from 'k6/http';
 import { check } from 'k6';
+import exec from 'k6/execution';
 import { Counter } from 'k6/metrics';
 
 const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
@@ -108,15 +109,35 @@ export function setup() {
   return { runId: `${Date.now()}` };
 }
 
+// Module scope is per virtual user, so this limits logging to a few lines per VU.
+const MAX_UNEXPECTED_LOGS_PER_VU = 3;
+let unexpectedLogged = 0;
+
+// Note on Math.random() below: these values only choose which simulated load-test
+// client a request pretends to be. They are not secrets, so predictability is
+// irrelevant (a static analyser flagging "insecure randomness" here is a false positive).
+
 function get(path, apiKey, endpoint) {
   const res = http.get(`${BASE_URL}${path}`, {
     headers: { 'X-Api-Key': apiKey },
     tags: { endpoint },
   });
 
-  check(res, { 'status is 200 or 429': (r) => r.status === 200 || r.status === 429 });
+  const expected = res.status === 200 || res.status === 429;
+  check(res, { 'status is 200 or 429': () => expected });
   if (res.status === 200) allowed.add(1);
   if (res.status === 429) rejected.add(1);
+
+  // A failed run should say WHAT failed, not just a percentage.
+  if (!expected && unexpectedLogged < MAX_UNEXPECTED_LOGS_PER_VU) {
+    unexpectedLogged++;
+    const servedBy = res.headers['X-Served-By'] || 'unknown';
+    const body = (res.body || '').toString().slice(0, 200).replace(/\s+/g, ' ');
+    console.warn(
+      `unexpected status ${res.status} scenario=${exec.scenario.name} endpoint=${endpoint} ` +
+      `served_by=${servedBy} error=${res.error || '-'} body=${body}`);
+  }
+
   return res;
 }
 
