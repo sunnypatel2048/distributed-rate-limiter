@@ -51,11 +51,19 @@ echo "Allowed (200) per replica:"
 awk '$1 == "200" { print $2 }' "$results" | sort | uniq -c
 
 allowed="$(awk '$1 == "200"' "$results" | wc -l | tr -d ' ')"
+unexpected="$(awk '$1 != "200" && $1 != "429"' "$results" | wc -l | tr -d ' ')"
 replicas="$(awk '{ print $2 }' "$results" | sort -u | grep -vc '^unknown$' || true)"
 
 echo
+# Anything other than 200 or 429 (a 502 from nginx, a 503, a dropped connection)
+# means the cluster misbehaved, even if the allowed count happens to look right.
+if [ "$unexpected" -gt 0 ]; then
+    echo "FAIL: $unexpected response(s) were neither 200 nor 429 (see status codes above)." >&2
+    exit 1
+fi
+
 if [ "$allowed" -eq "$EXPECTED_ALLOWED" ] && [ "$replicas" -ge 2 ]; then
-    echo "PASS: $allowed allowed in total across $replicas replicas (limit $EXPECTED_ALLOWED)."
+    echo "PASS: $allowed allowed in total across $replicas replicas (limit $EXPECTED_ALLOWED), no unexpected statuses."
 else
     echo "FAIL: $allowed allowed across $replicas replicas; expected exactly $EXPECTED_ALLOWED across 2+ replicas." >&2
     exit 1

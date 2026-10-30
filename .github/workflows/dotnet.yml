@@ -36,20 +36,13 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    # --wait blocks until every service is running and every health check passes,
+    # i.e. all three replicas answer HTTP (and only then does nginx start).
     - name: Start cluster (nginx -> 3 replicas -> Redis, plus Prometheus)
-      run: docker compose up -d --build
+      run: docker compose up -d --build --wait --wait-timeout 180
 
-    - name: Wait for the API to answer through nginx
-      run: |
-        for attempt in $(seq 1 60); do
-          if curl -sf -o /dev/null http://localhost:8080/health; then
-            echo "Cluster is up after ${attempt} attempt(s)."
-            exit 0
-          fi
-          sleep 2
-        done
-        echo "Cluster did not become healthy in time." >&2
-        exit 1
+    - name: Check the API answers through nginx
+      run: curl -fsS http://localhost:8080/health
 
     # One client, 30 concurrent requests: passes only if exactly 10 were allowed
     # in total while the requests were spread across at least two replicas.
