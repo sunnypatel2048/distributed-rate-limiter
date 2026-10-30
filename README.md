@@ -288,7 +288,7 @@ docker compose run --rm k6                                            # default:
 docker compose run --rm -e RATE=1000 -e DURATION_SECONDS=60 k6        # push harder
 ```
 
-Three scenarios run back to back, never overlapping:
+A 10 s warm-up runs first and isn't measured: it gets JIT compilation, connection pools and Redis's Lua script cache warm, so the first scenario doesn't just measure cold start. Then three scenarios run back to back, never overlapping:
 
 | Scenario | What it sends | What it measures |
 |---|---|---|
@@ -296,11 +296,11 @@ Three scenarios run back to back, never overlapping:
 | `rate_limited` | `/api/orders`, `/api/search`, `/api/products` from 100k random clients | Latency with the limiter's Redis round trip on every request, per algorithm. The difference from `baseline` is the limiter's overhead |
 | `burst` | 20 "hot" clients hammering `/api/orders` far over their limit | Correctness under load: total allowed must match the Token Bucket math (10 up front + 5 refilled per client in 30s) across all replicas |
 
-The run fails if any response is not `200`/`429`, if k6 can't keep up with the target rate (dropped iterations), if p99 exceeds 100 ms, or if the burst's allowed count falls outside the expected range. Full results are written to `loadtest/results/latest-summary.json` (git-ignored).
+The run fails if any response is not `200`/`429`, if k6 can't keep up with the target rate (dropped iterations), if p99 exceeds 100 ms, or if the burst's allowed count falls outside the expected range. Full results are written to `loadtest/results/latest-summary.json` (git-ignored). CI runs a short version of this test (200 req/s, 10 s per scenario) on every pull request and keeps the summary as a downloadable artifact.
 
 ### Results
 
-MacBook Air (Apple Silicon), Docker Desktop, with all six containers (nginx, 3 replicas, Redis, k6) on one machine. Same test at three target rates, 30 s per scenario.
+MacBook Air (Apple Silicon), Docker Desktop, with all six containers (nginx, 3 replicas, Redis, k6) on one machine. Same test at three target rates, 30 s per scenario. These runs predate the warm-up phase, so their first scenario (baseline) includes some cold-start latency; if anything, that makes the baseline look slower and the limiter overhead look smaller.
 
 **Highest tested rate: 4,000 req/s.** 246,003 requests across the run, **0 dropped iterations and 0 unexpected statuses**:
 

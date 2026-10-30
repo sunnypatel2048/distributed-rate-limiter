@@ -1,7 +1,4 @@
-# This workflow will build a .NET project
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-net
-
-name: .NET
+name: CI
 
 on:
   push:
@@ -14,7 +11,7 @@ permissions:
 
 jobs:
   build:
-
+    name: Build and test
     runs-on: ubuntu-latest
 
     steps:
@@ -27,5 +24,81 @@ jobs:
       run: dotnet restore
     - name: Build
       run: dotnet build --no-restore
+    # Includes the Testcontainers integration tests: GitHub's Ubuntu runners have Docker.
     - name: Test
       run: dotnet test --no-build --verbosity normal
+
+  cluster:
+    name: 3-replica cluster smoke test
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Start cluster (nginx -> 3 replicas -> Redis, plus Prometheus)
+      run: docker compose up -d --build
+
+    - name: Wait for the API to answer through nginx
+      run: |
+        for attempt in $(seq 1 60); do
+          if curl -sf -o /dev/null http://localhost:8080/health; then
+            echo "Cluster is up after ${attempt} attempt(s)."
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "Cluster did not become healthy in time." >&2
+        exit 1
+
+    # One client, 30 concurrent requests: passes only if exactly 10 were allowed
+    # in total while the requests were spread across at least two replicas.
+    - name: Verify one combined limit across replicas
+      run: bash scripts/verify-cluster.sh
+
+    - name: Verify /metrics is not reachable through nginx
+      run: |
+        status="$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/metrics)"
+        echo "GET /metrics via nginx -> ${status}"
+        test "${status}" = "404"
+
+    - name: Verify replicas expose rate limiter metrics internally
+      run: |
+        # Captured first: piping into `grep -q` can fail under pipefail when grep exits early.
+        metrics="$(docker compose exec -T nginx wget -qO- http://app1:8080/metrics)"
+        if [[ "${metrics}" == *"ratelimiter_decisions_total"* ]]; then
+          echo "app1 exposes ratelimiter_decisions_total"
+        else
+          echo "ratelimiter_decisions_total missing from app1 /metrics" >&2
+          exit 1
+        fi
+
+    # Short, gentle run: CI runners are small and shared, so this checks that the
+    # load test and its correctness thresholds pass, not how fast the runner is.
+    # The k6 container runs as a non-root user; on Linux it can't write into the
+    # runner's checkout unless the results folder is writable.
+    # P99_TARGET_MS is looser than the local default (100): shared runners have noisy
+    # neighbours, and this job checks correctness (statuses, burst count, keeping up
+    # with the rate), not raw speed.
+    - name: Load test smoke run (k6)
+      run: |
+        chmod a+rwx loadtest/results
+        docker compose run --rm \
+          -e RATE=200 -e DURATION_SECONDS=10 -e WARMUP_SECONDS=10 -e P99_TARGET_MS=500 \
+          k6
+
+    - name: Upload load test summary
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: k6-summary
+        path: loadtest/results/latest-summary.json
+        if-no-files-found: ignore
+
+    - name: Show container logs on failure
+      if: failure()
+      run: docker compose logs --no-color
+
+    - name: Tear down
+      if: always()
+      run: docker compose --profile loadtest down -v
