@@ -176,7 +176,9 @@ export function handleSummary(data) {
   const baseMed = stat(data, 'http_req_duration{scenario:baseline}', 'med');
   const limitedMed = stat(data, 'http_req_duration{scenario:rate_limited}', 'med');
   if (baseP99 !== undefined && limitedP99 !== undefined) {
-    lines.push(`Rate limiter overhead: p50 +${(limitedMed - baseMed).toFixed(2)} ms, p99 +${(limitedP99 - baseP99).toFixed(2)} ms (rate_limited vs baseline)`);
+    const signed = (d) => `${d >= 0 ? '+' : ''}${d.toFixed(2)} ms`;
+    lines.push(`Rate limiter overhead: p50 ${signed(limitedMed - baseMed)}, p99 ${signed(limitedP99 - baseP99)} (rate_limited vs baseline)`);
+    lines.push('  p50 is the reliable figure; at low load, p99 differences of a fraction of a ms are run-to-run noise.');
   }
 
   const limitedRejected = stat(data, 'rate_limit_rejected{scenario:rate_limited}', 'count') || 0;

@@ -237,17 +237,37 @@ Three scenarios run back to back, never overlapping:
 
 The run fails if any response is not `200`/`429`, if k6 can't keep up with the target rate (dropped iterations), if p99 exceeds 100 ms, or if the burst's allowed count falls outside the expected range. Full results are written to `loadtest/results/latest-summary.json` (git-ignored).
 
-_Results: TODO — fill in from a real run._
+### Results
+
+MacBook Air (Apple Silicon), Docker Desktop, with all six containers (nginx, 3 replicas, Redis, k6) on one machine. Same test at three target rates, 30 s per scenario.
+
+**Highest tested rate: 4,000 req/s.** 246,003 requests across the run, **0 dropped iterations and 0 unexpected statuses**:
 
 | Scenario | Throughput (req/s) | p50 | p95 | p99 |
 |---|---|---|---|---|
-| Baseline (no limiter) | | | | |
-| Rate limited (all algorithms) | | | | |
-| — Token Bucket | | | | |
-| — Sliding Window Counter | | | | |
-| — Fixed Window | | | | |
+| Baseline (`/health`, no limiter) | 4,000 | 0.18 ms | 0.35 ms | 1.01 ms |
+| Rate limited (all algorithms) | 4,000 | 0.28 ms | 0.42 ms | 1.04 ms |
+| — Token Bucket (`/api/orders`) | ~1,333 | 0.29 ms | 0.42 ms | 1.03 ms |
+| — Sliding Window Counter (`/api/search`) | ~1,333 | 0.28 ms | 0.42 ms | 1.07 ms |
+| — Fixed Window (`/api/products`) | ~1,333 | 0.28 ms | 0.42 ms | 0.99 ms |
+| Burst (20 hot clients, mostly `429`) | 200 | 1.16 ms | 2.08 ms | 4.11 ms |
 
-All numbers come from a single laptop running every container plus the load generator, so they're a lower bound and best read *relative to each other*. The limiter overhead (`rate_limited` minus `baseline`) is the meaningful figure.
+**Across rates:**
+
+| Target rate | Baseline p50 / p99 | Rate limited p50 / p99 | Limiter overhead (p50) | Dropped iterations | Burst allowed (expected 280) |
+|---|---|---|---|---|---|
+| 500 req/s | 0.34 / 1.60 ms | 0.49 / 1.46 ms | +0.14 ms | 0 | 280 |
+| 2,000 req/s | 0.21 / 0.75 ms | 0.35 / 1.25 ms | +0.14 ms | 0 | 280 |
+| 4,000 req/s | 0.18 / 1.01 ms | 0.28 / 1.04 ms | +0.10 ms | 0 | 280 |
+
+**What the numbers say**
+
+- **The limiter adds ~0.1–0.15 ms at the median**, consistently at every rate: about one round trip to Redis on the local Docker network. p99 stays near 1 ms with or without it, and differences there are within run-to-run noise.
+- **4,000 req/s is the highest rate tested, not the ceiling.** k6 never fell behind its schedule, so the cluster still had headroom. On a single laptop the load generator shares CPU with the system under test, so a higher number from this setup would say more about the laptop than the limiter.
+- **Latency got *lower* as load rose.** The likely cause is CPU power management: at low load, cores clock down and requests wait for them to ramp up. It's a reminder not to judge latency from a lightly loaded run.
+- **The three algorithms cost the same.** Each is one atomic Lua script call, and the per-algorithm differences are noise. Choose between them on behaviour (burst tolerance, boundary accuracy), not speed.
+- **Zero over-admission under burst load, in every run.** 20 clients sent 6,001 requests through three replicas. Each client gets 10 tokens up front and earns one every 6 s; the refills at 6, 12, 18 and 24 s land inside the 30 s run, and the 30 s one lands as it stops. Expected: 20 × (10 + 4) = **280 allowed. Measured: 280, all three times.**
+- **Max latencies (10–130 ms) are isolated outliers** (GC pauses and container scheduling on a shared laptop), not a trend.
 
 ## Project structure
 
