@@ -22,6 +22,11 @@ public static class RateLimitingExtensions
         services.TryAddEnumerable(ServiceDescriptor.Singleton<IValidateOptions<RateLimitingOptions>, RateLimitingOptionsValidator>());
         services.TryAddSingleton<IClientIdResolver, ApiKeyOrIpClientIdResolver>();
 
+        // IMeterFactory is registered by the ASP.NET Core host already; AddMetrics() makes
+        // this work in any host (and is a no-op if it's already there).
+        services.AddMetrics();
+        services.TryAddSingleton<RateLimiterMetrics>();
+
         return services;
     }
 
