@@ -1,8 +1,12 @@
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
 using RateLimiter.Core;
 using RateLimiter.Middleware;
 using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
+
+var instanceName = builder.Configuration["InstanceName"] ?? Environment.MachineName;
 
 // Single shared multiplexer for the app's lifetime — StackExchange.Redis
 // is thread-safe and designed to be reused, not created per-request.
@@ -31,12 +35,28 @@ builder.Services.AddDistributedRateLimiting(builder.Configuration);
 // ReverseProxy:TrustedProxies (set by docker-compose; empty for local dev).
 builder.Services.AddTrustedReverseProxies(builder.Configuration);
 
+// Metrics: the rate limiter's own meter plus ASP.NET Core's built-in HTTP metrics,
+// exposed in Prometheus format at /metrics. Each replica reports only its own
+// numbers; Prometheus scrapes all of them and sums for cluster-wide totals.
+builder.Services.AddOpenTelemetry()
+    .ConfigureResource(resource => resource.AddService("ratelimiter-demo", serviceInstanceId: instanceName))
+    .WithMetrics(metrics => metrics
+        .AddMeter(RateLimiterMetrics.MeterName)
+        .AddMeter("Microsoft.AspNetCore.Hosting")
+        // The default histogram buckets go 0, 5, 10, 25 ... -- sized for milliseconds.
+        // A limiter check takes ~0.1 ms (0.0001 s), so every sample would land in the
+        // first bucket and percentiles would be meaningless. Use sub-millisecond buckets.
+        .AddView("ratelimiter.check.duration", new ExplicitBucketHistogramConfiguration
+        {
+            Boundaries = [0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25]
+        })
+        .AddPrometheusExporter());
+
 var app = builder.Build();
 
 // Tag every response -- including 429s -- with the instance that handled it, so
 // you can watch the load balancer spread one client's requests across replicas
 // while the shared Redis enforces a single combined limit.
-var instanceName = builder.Configuration["InstanceName"] ?? Environment.MachineName;
 app.Use(async (context, next) =>
 {
     context.Response.Headers["X-Served-By"] = instanceName;
@@ -46,6 +66,10 @@ app.Use(async (context, next) =>
 // Order matters: resolve the real client IP first, THEN rate limit on it.
 app.UseTrustedReverseProxies();
 app.UseDistributedRateLimiting();
+
+// Prometheus scrape endpoint. Not under /api, so it's never rate limited.
+// nginx refuses /metrics from outside; Prometheus scrapes each replica directly.
+app.MapPrometheusScrapingEndpoint();
 
 // Not under /api, so no policy matches: never rate limited.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));

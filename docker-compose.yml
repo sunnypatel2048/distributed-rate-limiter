@@ -1,6 +1,7 @@
 # Two ways to use this file:
 #   docker compose up -d redis      -> just Redis on localhost:6379 (for `dotnet run` and the tests)
-#   docker compose up -d --build    -> the full cluster: nginx -> 3 app replicas -> 1 Redis
+#   docker compose up -d --build    -> the full cluster: nginx -> 3 app replicas -> 1 Redis,
+#                                      plus Prometheus on http://localhost:9090
 #
 # The API is then on http://localhost:8080 (through nginx). The app replicas are
 # deliberately NOT published to the host, so the only way in is through the proxy --
@@ -23,6 +24,10 @@ x-app: &app
     # nginx's fixed address on the network below; the only proxy whose
     # X-Forwarded-For header the apps will believe.
     ReverseProxy__TrustedProxies__0: 172.28.0.10
+    # One JSON object per log line, so fields like Policy and ClientId are queryable.
+    Logging__Console__FormatterName: json
+    Logging__Console__FormatterOptions__UseUtcTimestamp: "true"
+    Logging__Console__FormatterOptions__TimestampFormat: "yyyy-MM-ddTHH:mm:ss.fffZ"
 
 services:
   redis:
@@ -72,6 +77,21 @@ services:
     networks:
       ratelimiter:
         ipv4_address: 172.28.0.10
+
+  # Scrapes /metrics from every replica every 5s: http://localhost:9090
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - app1
+      - app2
+      - app3
+    restart: unless-stopped
+    networks:
+      - ratelimiter
 
   # Load generator. Not started by `docker compose up` (it's in the "loadtest" profile).
   # Runs INSIDE the Docker network and hits nginx directly, which keeps Docker Desktop's
