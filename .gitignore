@@ -12,3 +12,7 @@ obj/
 
 ## Misc
 *.log
+
+## Load test output (keep the folder, not the results)
+loadtest/results/*
+!loadtest/results/.gitkeep

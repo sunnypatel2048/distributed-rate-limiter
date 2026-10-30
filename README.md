@@ -112,7 +112,7 @@ Client disconnects (`OperationCanceledException`) are deliberately *not* treated
 - .NET 10 (minimal API + middleware)
 - Redis (state store, Lua scripting)
 - Docker Compose + nginx (local 3-replica cluster behind a load balancer)
-- k6 (load testing)
+- k6 (load testing, run as a container)
 
 ## Getting started
 
@@ -219,12 +219,55 @@ A denied request gets `429 Too Many Requests` with a JSON body:
 
 ## Benchmarks
 
-_TODO — fill in after load testing (Week 2)._
+Load tests use [k6](https://k6.io), run against the full Docker Compose cluster (nginx → 3 replicas → Redis). k6 runs as a container on the same Docker network, so Docker Desktop's host port forwarding stays out of the numbers.
 
-| Scenario | Replicas | Throughput (req/s) | p50 latency | p95 latency | p99 latency |
+```bash
+docker compose up -d --build
+docker compose run --rm k6                                            # default: 500 req/s, 30s per scenario
+docker compose run --rm -e RATE=1000 -e DURATION_SECONDS=60 k6        # push harder
+```
+
+Three scenarios run back to back, never overlapping:
+
+| Scenario | What it sends | What it measures |
+|---|---|---|
+| `baseline` | `/health` (no policy matches) | The cost of everything *except* the limiter: nginx hop, Kestrel, routing |
+| `rate_limited` | `/api/orders`, `/api/search`, `/api/products` from 100k random clients | Latency with the limiter's Redis round trip on every request, per algorithm. The difference from `baseline` is the limiter's overhead |
+| `burst` | 20 "hot" clients hammering `/api/orders` far over their limit | Correctness under load: total allowed must match the Token Bucket math (10 up front + 5 refilled per client in 30s) across all replicas |
+
+The run fails if any response is not `200`/`429`, if k6 can't keep up with the target rate (dropped iterations), if p99 exceeds 100 ms, or if the burst's allowed count falls outside the expected range. Full results are written to `loadtest/results/latest-summary.json` (git-ignored).
+
+### Results
+
+MacBook Air (Apple Silicon), Docker Desktop, with all six containers (nginx, 3 replicas, Redis, k6) on one machine. Same test at three target rates, 30 s per scenario.
+
+**Highest tested rate: 4,000 req/s.** 246,003 requests across the run, **0 dropped iterations and 0 unexpected statuses**:
+
+| Scenario | Throughput (req/s) | p50 | p95 | p99 |
+|---|---|---|---|---|
+| Baseline (`/health`, no limiter) | 4,000 | 0.18 ms | 0.35 ms | 1.01 ms |
+| Rate limited (all algorithms) | 4,000 | 0.28 ms | 0.42 ms | 1.04 ms |
+| — Token Bucket (`/api/orders`) | ~1,333 | 0.29 ms | 0.42 ms | 1.03 ms |
+| — Sliding Window Counter (`/api/search`) | ~1,333 | 0.28 ms | 0.42 ms | 1.07 ms |
+| — Fixed Window (`/api/products`) | ~1,333 | 0.28 ms | 0.42 ms | 0.99 ms |
+| Burst (20 hot clients, mostly `429`) | 200 | 1.16 ms | 2.08 ms | 4.11 ms |
+
+**Across rates:**
+
+| Target rate | Baseline p50 / p99 | Rate limited p50 / p99 | Limiter overhead (p50) | Dropped iterations | Burst allowed (expected 280) |
 |---|---|---|---|---|---|
-| Sustained load | | | | | |
-| Burst load | | | | | |
+| 500 req/s | 0.34 / 1.60 ms | 0.49 / 1.46 ms | +0.14 ms | 0 | 280 |
+| 2,000 req/s | 0.21 / 0.75 ms | 0.35 / 1.25 ms | +0.14 ms | 0 | 280 |
+| 4,000 req/s | 0.18 / 1.01 ms | 0.28 / 1.04 ms | +0.10 ms | 0 | 280 |
+
+**What the numbers say**
+
+- **The limiter adds ~0.1–0.15 ms at the median**, consistently at every rate: about one round trip to Redis on the local Docker network. p99 stays near 1 ms with or without it, and differences there are within run-to-run noise.
+- **4,000 req/s is the highest rate tested, not the ceiling.** k6 never fell behind its schedule, so the cluster still had headroom. On a single laptop the load generator shares CPU with the system under test, so a higher number from this setup would say more about the laptop than the limiter.
+- **Latency got *lower* as load rose.** The likely cause is CPU power management: at low load, cores clock down and requests wait for them to ramp up. It's a reminder not to judge latency from a lightly loaded run.
+- **The three algorithms cost the same.** Each is one atomic Lua script call, and the per-algorithm differences are noise. Choose between them on behaviour (burst tolerance, boundary accuracy), not speed.
+- **Zero over-admission under burst load, in every run.** 20 clients sent 6,001 requests through three replicas. Each client gets 10 tokens up front and earns one every 6 s; the refills at 6, 12, 18 and 24 s land inside the 30 s run, and the 30 s one lands as it stops. Expected: 20 × (10 + 4) = **280 allowed. Measured: 280, all three times.**
+- **Max latencies (10–130 ms) are isolated outliers** (GC pauses and container scheduling on a shared laptop), not a trend.
 
 ## Project structure
 
@@ -243,6 +286,7 @@ tests/
   RateLimiter.Middleware.Tests/  # middleware unit tests + end-to-end HTTP tests against real Redis
 deploy/nginx/nginx.conf    # load balancer config
 scripts/verify-cluster.sh  # proves one combined limit across replicas
+loadtest/k6/benchmark.js   # k6 load test (baseline vs. rate limited vs. burst)
 docker-compose.yml         # Redis, 3 app replicas, nginx
 ```
 

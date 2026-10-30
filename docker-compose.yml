@@ -73,6 +73,26 @@ services:
       ratelimiter:
         ipv4_address: 172.28.0.10
 
+  # Load generator. Not started by `docker compose up` (it's in the "loadtest" profile).
+  # Runs INSIDE the Docker network and hits nginx directly, which keeps Docker Desktop's
+  # host port forwarding out of the latency numbers.
+  #   docker compose run --rm k6
+  #   docker compose run --rm -e RATE=1000 -e DURATION_SECONDS=60 k6
+  k6:
+    image: grafana/k6:1.0.0
+    profiles: ["loadtest"]
+    depends_on:
+      - nginx
+    networks:
+      - ratelimiter
+    volumes:
+      - ./loadtest/k6:/scripts:ro
+      - ./loadtest/results:/results
+    environment:
+      BASE_URL: http://nginx
+      SUMMARY_PATH: /results/latest-summary.json
+    command: ["run", "/scripts/benchmark.js"]
+
 networks:
   ratelimiter:
     ipam:
