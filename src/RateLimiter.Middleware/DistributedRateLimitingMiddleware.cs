@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Globalization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
@@ -12,6 +13,7 @@ public sealed class DistributedRateLimitingMiddleware(
     IRateLimiterFactory factory,
     IClientIdResolver clientIdResolver,
     IOptions<RateLimitingOptions> options,
+    RateLimiterMetrics metrics,
     ILogger<DistributedRateLimitingMiddleware> logger)
 {
     // One limiter per policy for the app's lifetime. Required for the in-memory
@@ -33,6 +35,7 @@ public sealed class DistributedRateLimitingMiddleware(
 
         var clientId = clientIdResolver.Resolve(context);
 
+        var started = Stopwatch.GetTimestamp();
         RateLimitResult result;
         try
         {
@@ -43,30 +46,41 @@ public sealed class DistributedRateLimitingMiddleware(
             // Any limiter failure (Redis down, timeout, ...) lands here. Catching broadly
             // is deliberate: the rate limiter must never be the reason the API errors out
             // unless the policy explicitly asks for that.
+            var elapsed = Stopwatch.GetElapsedTime(started);
+
             if (policy.FailureMode == FailureMode.FailOpen)
             {
-                logger.LogWarning(ex, "Rate limiter unavailable for policy {Policy}; failing open.", policy.Name);
+                metrics.RecordDecision(policy, RateLimitOutcome.FailOpen, elapsed);
+                RateLimiterLog.FailingOpen(logger, ex, policy.Name);
                 await next(context);
                 return;
             }
 
-            logger.LogError(ex, "Rate limiter unavailable for policy {Policy}; failing closed.", policy.Name);
+            metrics.RecordDecision(policy, RateLimitOutcome.FailClosed, elapsed);
+            RateLimiterLog.FailingClosed(logger, ex, policy.Name);
             context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
             await context.Response.WriteAsJsonAsync(new { error = "rate_limiter_unavailable" });
             return;
         }
+
+        var checkDuration = Stopwatch.GetElapsedTime(started);
 
         context.Response.Headers["X-RateLimit-Limit"] = result.Limit.ToString(CultureInfo.InvariantCulture);
         context.Response.Headers["X-RateLimit-Remaining"] = result.Remaining.ToString(CultureInfo.InvariantCulture);
 
         if (result.IsAllowed)
         {
+            metrics.RecordDecision(policy, RateLimitOutcome.Allowed, checkDuration);
             await next(context);
             return;
         }
 
         // Retry-After is whole seconds; round up and never send 0 (which invites an instant retry).
         var retryAfterSeconds = Math.Max(1, (int)Math.Ceiling(result.RetryAfter.TotalSeconds));
+
+        metrics.RecordDecision(policy, RateLimitOutcome.Rejected, checkDuration);
+        RateLimiterLog.RequestRejected(logger, clientId, policy.Name, policy.Algorithm.ToString(), retryAfterSeconds);
+
         context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
         context.Response.Headers.RetryAfter = retryAfterSeconds.ToString(CultureInfo.InvariantCulture);
         await context.Response.WriteAsJsonAsync(new { error = "rate_limited", policy = policy.Name, retryAfterSeconds });

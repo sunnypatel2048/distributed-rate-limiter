@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Each replica exposes only its own counters. Prometheus scrapes all three and
+  # labels every series with instance="appN:8080"; sum() across instances gives the
+  # cluster-wide totals.
+  - job_name: ratelimiter-demo
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - app1:8080
+          - app2:8080
+          - app3:8080

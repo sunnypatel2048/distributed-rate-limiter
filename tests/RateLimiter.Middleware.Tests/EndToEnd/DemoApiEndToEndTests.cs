@@ -62,6 +62,39 @@ public class DemoApiEndToEndTests(RedisContainerFixture redis) : IClassFixture<R
     }
 
     [Fact]
+    public async Task MetricsEndpoint_ExposesDecisionCounts_InPrometheusFormat()
+    {
+        using var factory = new DemoAppFactory(redis.ConnectionString);
+        using var client = factory.CreateClient();
+        var apiKey = NewApiKey();
+
+        for (var i = 0; i < 11; i++)
+        {
+            await Get(client, "/api/orders", apiKey); // 10 allowed, then 1 rejected
+        }
+
+        var metrics = await client.GetStringAsync("/metrics");
+
+        Assert.Contains("ratelimiter_decisions_total", metrics);
+        Assert.Contains("ratelimiter_check_duration_seconds_bucket", metrics);
+        Assert.Contains("policy=\"orders\"", metrics);
+        Assert.Contains("outcome=\"allowed\"", metrics);
+        Assert.Contains("outcome=\"rejected\"", metrics);
+    }
+
+    [Fact]
+    public async Task MetricsEndpoint_IsNotRateLimited()
+    {
+        using var factory = new DemoAppFactory(redis.ConnectionString);
+        using var client = factory.CreateClient();
+
+        var response = await Get(client, "/metrics", NewApiKey());
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.False(response.Headers.Contains("X-RateLimit-Limit"));
+    }
+
+    [Fact]
     public async Task HealthEndpoint_IsNeverRateLimited()
     {
         using var factory = new DemoAppFactory(redis.ConnectionString);

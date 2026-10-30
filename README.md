@@ -15,6 +15,7 @@ A distributed, Redis-backed rate limiting library and middleware for .NET 10, su
 - [Tech stack](#tech-stack)
 - [Getting started](#getting-started)
 - [API reference](#api-reference)
+- [Observability](#observability)
 - [Benchmarks](#benchmarks)
 - [Project structure](#project-structure)
 - [Future improvements](#future-improvements)
@@ -29,7 +30,8 @@ Most rate limiter tutorials use a single in-memory counter, which silently break
 - Distributed, atomic enforcement via Redis + Lua scripts (no race conditions across instances)
 - .NET 10 middleware — drop into any minimal API with per-route/per-client configuration
 - Standard rate limit response headers (`X-RateLimit-Remaining`, `Retry-After`)
-- `/metrics` endpoint exposing allowed vs. rejected request counts
+- Metrics (allowed / rejected / fail-open / fail-closed per policy, limiter latency) via OpenTelemetry, scraped by Prometheus across all replicas
+- Structured JSON logs with source-generated, queryable log events
 - Load tested with k6 across multiple replicas behind a load balancer
 
 ## Architecture
@@ -91,7 +93,7 @@ Keeping all rate-limit state out of the app process is what makes horizontal sca
 4. Redis atomically checks and updates state, returning allow/deny plus remaining quota
 5. **Allowed** → request forwarded to the handler; response includes `X-RateLimit-Remaining`
 6. **Denied** → middleware short-circuits with `429`, includes `Retry-After`
-7. `/metrics` counters increment for allowed vs. rejected requests
+7. The decision is counted in `ratelimiter.decisions` (by policy, algorithm and outcome) and the check's latency recorded in `ratelimiter.check.duration`
 
 ## Failure handling
 
@@ -113,6 +115,7 @@ Client disconnects (`OperationCanceledException`) are deliberately *not* treated
 - Redis (state store, Lua scripting)
 - Docker Compose + nginx (local 3-replica cluster behind a load balancer)
 - k6 (load testing, run as a container)
+- OpenTelemetry + Prometheus (metrics), JSON console logging
 
 ## Getting started
 
@@ -202,6 +205,7 @@ Policies live in the `RateLimiting` section of `appsettings.json` and are valida
 | `GET /api/search?q=` | `search` | Sliding Window Counter (fail closed) | 20 / min |
 | `GET /api/products` | `api-default` | Fixed Window | 100 / min |
 | `GET /health`, `GET /redis-check` | none | not limited | |
+| `GET /metrics` | none | not limited (blocked at nginx; Prometheus scrapes replicas directly) | |
 
 ### Response headers on limited routes
 
@@ -215,6 +219,63 @@ A denied request gets `429 Too Many Requests` with a JSON body:
 
 ```json
 { "error": "rate_limited", "policy": "orders", "retryAfterSeconds": 6 }
+```
+
+## Observability
+
+### Metrics
+
+The middleware records two instruments with the standard .NET metrics API (`System.Diagnostics.Metrics`). The demo exports them, plus ASP.NET Core's built-in HTTP metrics, through OpenTelemetry at `/metrics` in Prometheus format.
+
+| Metric (Prometheus name) | Type | Labels |
+|---|---|---|
+| `ratelimiter_decisions_total` | counter | `policy`, `algorithm`, `outcome` = `allowed` / `rejected` / `fail_open` / `fail_closed` |
+| `ratelimiter_check_duration_seconds` | histogram | same as above |
+
+`docker compose up -d --build` also starts Prometheus at **http://localhost:9090**, scraping every replica every 5 s. Useful queries:
+
+```promql
+# Cluster-wide decisions per second, by policy and outcome
+sum by (policy, outcome) (rate(ratelimiter_decisions_total[1m]))
+
+# Share of requests rejected, per policy
+sum by (policy) (rate(ratelimiter_decisions_total{outcome="rejected"}[1m]))
+  / sum by (policy) (rate(ratelimiter_decisions_total[1m]))
+
+# p99 limiter check latency (the Redis round trip), per policy
+histogram_quantile(0.99, sum by (le, policy) (rate(ratelimiter_check_duration_seconds_bucket[1m])))
+
+# Load per replica: nginx's round robin, visible
+sum by (instance) (rate(ratelimiter_decisions_total[1m]))
+
+# Alert candidate: the limiter is failing open or closed (Redis trouble)
+sum(rate(ratelimiter_decisions_total{outcome=~"fail_open|fail_closed"}[1m])) > 0
+```
+
+Run `docker compose run --rm k6` and watch these move in Prometheus's graph view.
+
+**Design choices**
+
+- **Per-replica metrics, aggregated by Prometheus.** Each replica counts only what it handled. Keeping a cluster-wide count in Redis instead would add a write to every request, on the very path the benchmarks show costs ~0.1 ms. Summing time series is Prometheus's job.
+- **No client id in metric labels.** Every distinct label value is a separate time series, so a label per client would grow without bound. Per-client detail belongs in logs.
+- **Sub-millisecond histogram buckets.** The OpenTelemetry default buckets (0, 5, 10, 25, …) assume milliseconds. A ~0.0001 s limiter check would land entirely in the first bucket, so the demo configures buckets from 50 µs to 250 ms.
+- **`/metrics` isn't public.** nginx returns `404` for it. Prometheus reaches each replica directly on the internal Docker network.
+
+### Logs
+
+In the cluster, every replica writes one JSON object per line (`Logging__Console__FormatterName=json`). Rate limiter events are source-generated `[LoggerMessage]` methods with named fields, so `Policy`, `ClientId` and so on arrive as queryable properties rather than text inside a message:
+
+| Event id | Level | When |
+|---|---|---|
+| 1001 | Debug | A request was rate limited (`ClientId`, `Policy`, `Algorithm`, `RetryAfterSeconds`) |
+| 2001 | Warning | Limiter unavailable, failing open (with the exception) |
+| 2002 | Error | Limiter unavailable, failing closed (with the exception) |
+
+Rejections log at **Debug** on purpose: at thousands of requests per second, a line per `429` would bury everything else, and `ratelimiter_decisions_total` already counts them. Turn it on to investigate one client:
+
+```bash
+docker compose logs -f app1
+# enable rejection logs: add  Logging__LogLevel__RateLimiter.Middleware: Debug  to the app environment
 ```
 
 ## Benchmarks
@@ -285,9 +346,10 @@ tests/
   RateLimiter.Core.Tests/        # algorithm unit tests + Redis integration tests (Testcontainers)
   RateLimiter.Middleware.Tests/  # middleware unit tests + end-to-end HTTP tests against real Redis
 deploy/nginx/nginx.conf    # load balancer config
+deploy/prometheus/         # Prometheus scrape config for the 3 replicas
 scripts/verify-cluster.sh  # proves one combined limit across replicas
 loadtest/k6/benchmark.js   # k6 load test (baseline vs. rate limited vs. burst)
-docker-compose.yml         # Redis, 3 app replicas, nginx
+docker-compose.yml         # Redis, 3 app replicas, nginx, Prometheus (+ k6 on demand)
 ```
 
 ## Future improvements

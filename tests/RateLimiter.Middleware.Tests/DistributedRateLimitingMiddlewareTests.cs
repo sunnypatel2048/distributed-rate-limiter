@@ -57,6 +57,7 @@ public class DistributedRateLimitingMiddlewareTests
             factory ?? new RateLimiterFactory(new FakeTimeProvider(DateTimeOffset.UtcNow)),
             new ApiKeyOrIpClientIdResolver(options),
             options,
+            TestMetrics.Create(),
             NullLogger<DistributedRateLimitingMiddleware>.Instance);
         return (middleware, next);
     }
