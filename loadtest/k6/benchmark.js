@@ -1,7 +1,11 @@
 // Load test for the nginx -> 3 replicas -> Redis cluster.
 //
-// Three scenarios run back to back (never overlapping, so they don't compete for CPU):
+// A warm-up runs first, then three measured scenarios, back to back (never
+// overlapping, so they don't compete for CPU):
 //
+//   warmup        Not measured. Hits every endpoint so JIT compilation, connection
+//                 pools and Redis's Lua script cache are warm before measuring;
+//                 otherwise the first scenario's p99 is just cold start.
 //   baseline      /health at RATE req/s. Same app, same nginx hop, NO rate limiter.
 //   rate_limited  /api/orders, /api/search, /api/products at RATE req/s, spread over
 //                 100k random clients so almost every request is allowed. Measures the
@@ -24,6 +28,7 @@ const DURATION_SECONDS = parseInt(__ENV.DURATION_SECONDS || '30', 10);
 const BURST_CLIENTS = parseInt(__ENV.BURST_CLIENTS || '20', 10);
 const BURST_RATE = parseInt(__ENV.BURST_RATE || '200', 10);
 const P99_TARGET_MS = parseInt(__ENV.P99_TARGET_MS || '100', 10);
+const WARMUP_SECONDS = parseInt(__ENV.WARMUP_SECONDS || '10', 10);
 const GAP_SECONDS = 5;
 
 // Must match the "orders" policy in src/RateLimiter.Demo/appsettings.json.
@@ -47,26 +52,30 @@ const rejected = new Counter('rate_limit_rejected');
 // 429 is a correct answer from a rate limiter, not an error. Anything else is.
 http.setResponseCallback(http.expectedStatuses(200, 429));
 
-function scenario(exec, rate, index) {
+function scenario(exec, rate, startSeconds, durationSeconds) {
   return {
     executor: 'constant-arrival-rate',
     exec,
     rate,
     timeUnit: '1s',
-    duration: `${DURATION_SECONDS}s`,
+    duration: `${durationSeconds}s`,
     preAllocatedVUs: 50,
     maxVUs: 1000,
-    startTime: `${index * (DURATION_SECONDS + GAP_SECONDS)}s`,
+    startTime: `${startSeconds}s`,
   };
 }
+
+// Start time of the n-th measured scenario (0-based), after the warm-up.
+const measuredStart = (n) => WARMUP_SECONDS + GAP_SECONDS + n * (DURATION_SECONDS + GAP_SECONDS);
 
 const latencyTarget = [`p(99)<${P99_TARGET_MS}`];
 
 export const options = {
   scenarios: {
-    baseline: scenario('baseline', RATE, 0),
-    rate_limited: scenario('rateLimited', RATE, 1),
-    burst: scenario('burst', BURST_RATE, 2),
+    warmup: scenario('warmup', RATE, 0, WARMUP_SECONDS),
+    baseline: scenario('baseline', RATE, measuredStart(0), DURATION_SECONDS),
+    rate_limited: scenario('rateLimited', RATE, measuredStart(1), DURATION_SECONDS),
+    burst: scenario('burst', BURST_RATE, measuredStart(2), DURATION_SECONDS),
   },
   summaryTrendStats: ['avg', 'min', 'med', 'p(95)', 'p(99)', 'max'],
   thresholds: {
@@ -109,6 +118,13 @@ function get(path, apiKey, endpoint) {
   if (res.status === 200) allowed.add(1);
   if (res.status === 429) rejected.add(1);
   return res;
+}
+
+export function warmup(data) {
+  // Every endpoint, random clients: warms all three Lua scripts and every replica.
+  const paths = [{ name: 'health', path: '/health' }, ...ENDPOINTS];
+  const endpoint = paths[Math.floor(Math.random() * paths.length)];
+  get(endpoint.path, `${data.runId}-warmup-${Math.floor(Math.random() * 100000)}`, endpoint.name);
 }
 
 export function baseline(data) {
@@ -159,7 +175,7 @@ export function handleSummary(data) {
 
   const lines = [
     '',
-    `Rate limiter benchmark: ${RATE} req/s target, ${DURATION_SECONDS}s per scenario, via ${BASE_URL}`,
+    `Rate limiter benchmark: ${RATE} req/s target, ${DURATION_SECONDS}s per scenario after a ${WARMUP_SECONDS}s unmeasured warm-up, via ${BASE_URL}`,
     '',
     header,
     '-'.repeat(header.length),

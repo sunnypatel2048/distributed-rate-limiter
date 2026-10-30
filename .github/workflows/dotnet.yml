@@ -75,8 +75,25 @@ jobs:
 
     # Short, gentle run: CI runners are small and shared, so this checks that the
     # load test and its correctness thresholds pass, not how fast the runner is.
+    # The k6 container runs as a non-root user; on Linux it can't write into the
+    # runner's checkout unless the results folder is writable.
+    # P99_TARGET_MS is looser than the local default (100): shared runners have noisy
+    # neighbours, and this job checks correctness (statuses, burst count, keeping up
+    # with the rate), not raw speed.
     - name: Load test smoke run (k6)
-      run: docker compose run --rm -e RATE=200 -e DURATION_SECONDS=10 k6
+      run: |
+        chmod a+rwx loadtest/results
+        docker compose run --rm \
+          -e RATE=200 -e DURATION_SECONDS=10 -e WARMUP_SECONDS=10 -e P99_TARGET_MS=500 \
+          k6
+
+    - name: Upload load test summary
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: k6-summary
+        path: loadtest/results/latest-summary.json
+        if-no-files-found: ignore
 
     - name: Show container logs on failure
       if: failure()
