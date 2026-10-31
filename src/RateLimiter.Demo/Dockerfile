@@ -21,6 +21,12 @@ FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 WORKDIR /app
 COPY --from=build /app/publish .
 
+# curl is only for the container health check (docker-compose.yml): the ASP.NET
+# runtime image ships without an HTTP client.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
 # The official .NET images ship a non-root "app" user; don't run the API as root.
 USER $APP_UID
 
