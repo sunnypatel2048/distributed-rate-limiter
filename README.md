@@ -1,6 +1,20 @@
 # Distributed Rate Limiter (.NET 10)
 
+[![CI](https://github.com/sunnypatel2048/distributed-rate-limiter/actions/workflows/dotnet.yml/badge.svg)](https://github.com/sunnypatel2048/distributed-rate-limiter/actions/workflows/dotnet.yml)
+![.NET 10](https://img.shields.io/badge/.NET-10-512BD4)
+![Redis 7](https://img.shields.io/badge/Redis-7-DC382D)
+![Tests: 88](https://img.shields.io/badge/tests-88-brightgreen)
+
 A distributed, Redis-backed rate limiting library and middleware for .NET 10, supporting multiple limiting algorithms with atomic, race-condition-free enforcement across horizontally scaled instances.
+
+## Highlights
+
+- **One limit across every replica.** Three app replicas behind nginx share state in Redis, and every check-and-update is a single atomic Lua script. CI proves it on every pull request: one client sends 30 concurrent requests across the replicas, and exactly 10 are allowed.
+- **Three algorithms behind one interface.** Token Bucket, Sliding Window Counter and Fixed Window, each in-memory and Redis-backed, chosen per route in `appsettings.json`.
+- **~0.1 ms of overhead.** Load-tested with k6 at up to 4,000 req/s with zero dropped requests: the limiter adds ~0.1–0.15 ms at the median, p99 stays ~1 ms, and burst traffic is admitted *exactly* to the limit (280 of 280 expected).
+- **Built for failure.** Fail-open or fail-closed per route when Redis is down, `X-Forwarded-For` trusted only from the proxy, config validated at startup, and nginx routes only to replicas that pass a health check.
+- **Observable.** OpenTelemetry metrics (decisions by policy and outcome, limiter latency) scraped by Prometheus across all replicas, plus structured JSON logs.
+- **88 automated tests**, from algorithm unit tests to end-to-end HTTP tests against real Redis, plus a CI job that runs the whole cluster and a load test.
 
 ## Table of contents
 
@@ -14,6 +28,7 @@ A distributed, Redis-backed rate limiting library and middleware for .NET 10, su
 - [Failure handling](#failure-handling)
 - [Tech stack](#tech-stack)
 - [Getting started](#getting-started)
+- [Testing](#testing)
 - [API reference](#api-reference)
 - [Observability](#observability)
 - [Benchmarks](#benchmarks)
@@ -37,17 +52,16 @@ Most rate limiter tutorials use a single in-memory counter, which silently break
 ## Architecture
 
 ```mermaid
-flowchart TD
-    Client[Client] --> LB[nginx<br/>round-robin load balancer]
-    LB --> I1[app1]
-    LB --> I2[app2]
-    LB --> I3[app3]
-    I1 --> Redis[(Redis<br/>Atomic Lua Script)]
-    I2 --> Redis
-    I3 --> Redis
-    Redis -->|Allowed| Allow[Forward to Handler]
-    Redis -->|Denied| Deny[429 Too Many Requests]
+flowchart LR
+    Client([Client]) --> LB[nginx<br/>round robin,<br/>healthy replicas only]
+    LB --> A1[app1]
+    LB --> A2[app2]
+    LB --> A3[app3]
+    A1 & A2 & A3 -->|"one atomic Lua script<br/>per request"| Redis[(Redis)]
+    Prom[Prometheus] -. scrapes /metrics .-> A1 & A2 & A3
 ```
+
+Inside each replica, the middleware matches the request to a route policy, identifies the client, and runs that policy's Lua script in Redis. Allowed requests continue to the endpoint with `X-RateLimit-*` headers; denied ones get `429` with `Retry-After`.
 
 App instances are stateless — they hold no counters in memory. Redis is the single source of truth for rate limit state, shared across every instance, so the limit is enforced consistently no matter which instance a request lands on.
 
@@ -161,6 +175,8 @@ docker compose down                   # tear it all down
 
 The app replicas aren't published to the host; the only way in is through nginx on port 8080.
 
+**Startup order.** Each replica has a health check (`GET /health`), and nginx starts only once all three pass. Without it, nginx would accept traffic while replicas were still booting, take each one out of rotation after its first refused connection, and briefly answer `502` with no replica left. CI caught exactly that, which is why the cluster job and `verify-cluster.sh` now fail on any status other than `200` or `429`.
+
 ### Using it in your own API
 
 ```csharp
@@ -172,6 +188,19 @@ builder.Services.AddDistributedRateLimiting(builder.Configuration);
 var app = builder.Build();
 app.UseDistributedRateLimiting();
 ```
+
+## Testing
+
+| Layer | What it covers | Where | Tests |
+|---|---|---|---|
+| Algorithm unit tests | All three algorithms in memory: limits, window rollover, refill, capacity caps, client isolation, and concurrent requests admitting exactly the limit. `FakeTimeProvider` controls time, so nothing sleeps | `RateLimiter.Core.Tests` | 20 |
+| Redis integration | The same behaviour against a real Redis (Testcontainers), plus three independent "instances" racing on one client and admitting exactly the limit, and clock skew between instances | `RateLimiter.Core.Tests/Integration` | 16 |
+| Middleware unit tests | Policy matching, startup validation, client identity, trusted forwarded headers, fail-open/closed, `Retry-After` rounding, metrics tags and structured log fields | `RateLimiter.Middleware.Tests` | 43 |
+| End-to-end HTTP | The real demo app over HTTP against real Redis: route policies, `429` responses, `/metrics`, and two app instances enforcing one combined limit | `RateLimiter.Middleware.Tests/EndToEnd` | 9 |
+| Cluster smoke test | `docker compose`: nginx + 3 replicas + Redis, `verify-cluster.sh`, `/metrics` blocked at nginx | CI | — |
+| Load test | k6: overhead vs. baseline, per-algorithm latency, burst correctness | CI (short run) and locally | — |
+
+The 25 Redis integration and end-to-end tests are tagged `Category=Integration` and need Docker; the 63 unit tests run anywhere in a few seconds (`dotnet test --filter "Category!=Integration"`). CI runs everything on every pull request.
 
 ## API reference
 
@@ -354,6 +383,8 @@ docker-compose.yml         # Redis, 3 app replicas, nginx, Prometheus (+ k6 on d
 
 ## Future improvements
 
-- Redis Cluster for high availability (remove single point of failure)
-- Local in-memory caching layer with periodic sync, trading strict accuracy for lower latency
-- Per-client dynamic limit configuration via an admin API
+- **Redis high availability** (Sentinel or Redis Cluster). Keys are already hash-tagged for Cluster, so multi-key scripts stay on one shard.
+- **Quota leasing:** each replica takes a small batch of tokens from Redis at a time and spends them locally, trading a little accuracy for far fewer Redis round trips at very high request rates.
+- **Per-client tiers** (e.g. by API plan) through a pluggable policy resolver, instead of one limit per route.
+- **Exact-limit algorithms** such as Sliding Window Log or GCRA, for routes where the Sliding Window Counter's approximation isn't acceptable.
+- **NuGet packages** for `RateLimiter.Core` and `RateLimiter.Middleware`.
